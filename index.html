@@ -326,7 +326,7 @@ function DayForm({ initial, canDelete, onSave, onCancel, onDelete }) {
 }
 
 /* ---------- Modo entrenamiento (controlado) ---------- */
-function WorkoutOverlay({ ex, w, doneArr, nextEx, onComplete, onAdvance, onAddTime, onPauseResume, onSetReps, onClose, onNext, onFinish, onStop, bleState, onConnectBle, onOpenSensorMonitor, wavePoints }) {
+function WorkoutOverlay({ ex, w, doneArr, nextEx, onComplete, onAdvance, onAddTime, onPauseResume, onSetReps, onClose, onNext, onFinish, onStop, bleState, onConnectBle, onOpenSensorMonitor, wavePoints, calib, calibProfile, onCalibStart, onCalibFinish, onCalibCancel, onCalibReset }) {
   const [confirmStop, setConfirmStop] = useState(false);
   const total = ex.sets;
   const phase = w.phase;
@@ -340,6 +340,7 @@ function WorkoutOverlay({ ex, w, doneArr, nextEx, onComplete, onAdvance, onAddTi
   const isLast = setIdx >= total - 1;
   const durations = w.durations || {};
   const reps = w.reps || "";
+  const calibActive = !!(calib && calib.exId === ex.id);
 
   return (
     <div className="overlay">
@@ -414,6 +415,28 @@ function WorkoutOverlay({ ex, w, doneArr, nextEx, onComplete, onAdvance, onAddTi
                   </svg>
                 </div>
               )}
+              <div className={"calib-box" + (calibActive ? " rec" : "")}>
+                {calibActive ? (
+                  <>
+                    <div className="calib-title">🎯 Calibrando · haz 3-5 repeticiones normales</div>
+                    <div className="calib-count">{calib.count}<span>movimientos detectados</span></div>
+                    <div className="calib-btns">
+                      <button className="t-btn" type="button" onClick={onCalibCancel}>Cancelar</button>
+                      <button className="t-btn" type="button" onClick={onCalibFinish}>Terminar y guardar</button>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <div className="calib-status">
+                      {calibProfile ? `🎯 Calibrado ✓ · ${calibProfile.reps} reps · ~${(calibProfile.medDur / 1000).toFixed(1)}s` : "🎯 Sin calibrar · valores por defecto"}
+                    </div>
+                    <div className="calib-btns">
+                      <button className="t-btn" type="button" onClick={onCalibStart}>{calibProfile ? "Recalibrar" : "Calibrar"}</button>
+                      {calibProfile && <button className="t-btn danger2" type="button" onClick={onCalibReset}>Restablecer</button>}
+                    </div>
+                  </>
+                )}
+              </div>
               <div className="ov-hud-actions">
                 <span className="hud-foot">Barra inmóvil &gt; 3.5s inicia descanso automáticamente</span>
                 {onOpenSensorMonitor && (
@@ -643,6 +666,9 @@ function SensorMonitorModal({
   onStartDemo,
   onStopDemo,
   onClearTelemetry,
+  calibCount,
+  onExportCalib,
+  onImportCalib,
 }) {
   const [activeTab, setActiveTab] = useState("chart"); // 'chart' | '3d' | 'kpis' | 'info'
   const [chartMode, setChartMode] = useState("accel"); // 'accel' | 'gyro' | 'dual'
@@ -1300,6 +1326,13 @@ function SensorMonitorModal({
             <div className="sensor-info-card">
               <div className="sensor-card-head">Exportación y Diagnóstico</div>
               <p className="info-desc">
+                Calibraciones de ejercicios guardadas en este navegador: <b>{calibCount || 0}</b>. Exporta un respaldo o impórtalo en otro dispositivo (los ejercicios deben tener el mismo ID).
+              </p>
+              <div className="info-actions">
+                <button className="s-btn secondary" onClick={onExportCalib}>⬇ Exportar calibración</button>
+                <button className="s-btn secondary" onClick={onImportCalib}>⬆ Importar calibración</button>
+              </div>
+              <p className="info-desc">
                 Puedes descargar todas las muestras registradas durante esta sesión para analizarlas en Excel, Python o MATLAB:
               </p>
               <div className="info-actions">
@@ -1329,6 +1362,127 @@ function SensorMonitorModal({
   );
 }
 
+/* ---------- Calibración de ejercicios (patrón de ciclo por ejercicio) ---------- */
+const CALIB_KEY = "calib_v1";
+const CALIB_TPL_N = 32;
+const CALIB_ACT = 0.08;      // umbral de actividad (G, aceleración neta filtrada)
+const CALIB_GAP_MS = 400;    // pausa que separa un movimiento del siguiente
+const CALIB_MIN_BURST_MS = 350;
+
+function calibClamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+function calibMedian(arr) {
+  if (!arr.length) return 0;
+  const s = [...arr].sort((a, b) => a - b);
+  const m = Math.floor(s.length / 2);
+  return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+}
+function calibResampleZ(trace, n) {
+  const out = new Array(n);
+  const L = trace.length;
+  if (L < 2) return out.fill(0);
+  for (let i = 0; i < n; i++) {
+    const x = (i / (n - 1)) * (L - 1);
+    const i0 = Math.floor(x), i1 = Math.min(L - 1, i0 + 1), fr = x - i0;
+    out[i] = trace[i0] * (1 - fr) + trace[i1] * fr;
+  }
+  const mean = out.reduce((a, b) => a + b, 0) / n;
+  let sd = Math.sqrt(out.reduce((a, b) => a + (b - mean) * (b - mean), 0) / n);
+  if (sd < 1e-6) sd = 1;
+  return out.map((v) => (v - mean) / sd);
+}
+function calibPearson(a, b) {
+  const n = Math.min(a.length, b.length);
+  if (!n) return 0;
+  let s = 0;
+  for (let i = 0; i < n; i++) s += a[i] * b[i];
+  return s / n; // ambas ya están normalizadas (media 0, desv. 1)
+}
+/* Segmenta la señal en "movimientos" (ráfagas de actividad separadas por pausas) */
+function calibSegmentBursts(samples, closeOpen) {
+  const bursts = [];
+  let cur = null, lastActive = 0;
+  const close = () => {
+    const dur = cur.end - cur.start;
+    if (dur >= CALIB_MIN_BURST_MS) {
+      const tr = samples.slice(cur.i0, cur.i1 + 1).map((s) => s.f);
+      bursts.push({ dur, max: Math.max(...tr), min: Math.min(...tr), trace: tr });
+    }
+    cur = null;
+  };
+  for (let i = 0; i < samples.length; i++) {
+    const s = samples[i];
+    if (Math.abs(s.f) > CALIB_ACT) {
+      if (!cur) cur = { start: s.t, end: s.t, i0: i, i1: i };
+      cur.end = s.t; cur.i1 = i; lastActive = s.t;
+    } else if (cur && s.t - lastActive > CALIB_GAP_MS) {
+      close();
+    }
+  }
+  if (cur && closeOpen) close();
+  return bursts;
+}
+/* Reproduce la misma máquina de estados de detección sobre las muestras grabadas */
+function calibReplayReps(samples, P) {
+  let phase = "IDLE", start = 0, trace = [];
+  const reps = [];
+  for (const s of samples) {
+    const f = s.f, t = s.t;
+    if (phase === "IDLE") {
+      if (f < P.down) { phase = "BAJADA"; start = t; trace = [f]; }
+      else if (f > P.up) { phase = "SUBIDA"; start = t; trace = [f]; }
+    } else if (phase === "BAJADA") {
+      trace.push(f);
+      if (f > P.up && t - start > 200) phase = "SUBIDA";
+    } else {
+      trace.push(f);
+      if (f <= P.quiet && t - start >= P.minRepMs) { reps.push({ dur: t - start, trace }); phase = "IDLE"; }
+    }
+  }
+  return reps;
+}
+function calibBuildProfile(samples) {
+  const bursts = calibSegmentBursts(samples, true);
+  if (bursts.length < 2) return { ok: false, msg: "Se detectaron menos de 2 movimientos. Repite con 3-5 reps." };
+  const medMax = calibMedian(bursts.map((b) => b.max));
+  const medMin = calibMedian(bursts.map((b) => b.min));
+  if (Math.max(medMax, -medMin) < 0.1) return { ok: false, msg: "Señal muy débil. Revisa que el sensor esté firme en la barra." };
+  const up = calibClamp(0.5 * medMax, 0.08, 0.4);
+  const down = -calibClamp(0.5 * -medMin, 0.08, 0.4);
+  let quiet = calibClamp(0.25 * Math.min(medMax, -medMin), 0.04, 0.1);
+  quiet = Math.min(quiet, 0.8 * Math.min(up, -down));
+  const P = { up, down, quiet, minRepMs: 300 };
+  const reps = calibReplayReps(samples, P);
+  if (reps.length < 2) return { ok: false, msg: "No se pudo aislar el ciclo. Repite con movimientos más marcados." };
+  const medDur = calibMedian(reps.map((r) => r.dur));
+  const good = reps.filter((r) => r.dur >= 0.4 * medDur && r.dur <= 2.5 * medDur);
+  if (good.length < 2) return { ok: false, msg: "Las repeticiones fueron muy distintas entre sí. Repite con ritmo parejo." };
+  const gd = good.map((r) => r.dur);
+  const minRepMs = Math.max(300, Math.round(0.6 * Math.min(...gd)));
+  const maxRepMs = Math.round(1.8 * Math.max(...gd));
+  const zs = good.map((r) => calibResampleZ(r.trace, CALIB_TPL_N));
+  const tplRaw = new Array(CALIB_TPL_N).fill(0).map((_, i) => zs.reduce((a, z) => a + z[i], 0) / zs.length);
+  const mean = tplRaw.reduce((a, b) => a + b, 0) / CALIB_TPL_N;
+  let sd = Math.sqrt(tplRaw.reduce((a, b) => a + (b - mean) * (b - mean), 0) / CALIB_TPL_N);
+  if (sd < 1e-6) sd = 1;
+  const tpl = tplRaw.map((v) => Math.round(((v - mean) / sd) * 1000) / 1000);
+  const corrs = zs.map((z) => calibPearson(z, tpl));
+  const minCorr = calibClamp(Math.min(...corrs) - 0.2, 0.25, 0.6);
+  return {
+    ok: true,
+    profile: {
+      v: 1, ts: Date.now(), reps: good.length, bursts: bursts.length,
+      up: Math.round(up * 1000) / 1000, down: Math.round(down * 1000) / 1000, quiet: Math.round(quiet * 1000) / 1000,
+      minRepMs, maxRepMs, minCorr: Math.round(minCorr * 100) / 100, tpl, medDur: Math.round(medDur),
+    },
+  };
+}
+/* ¿El movimiento detectado coincide con el patrón calibrado? */
+function calibMatches(P, trace, durMs) {
+  if (durMs > P.maxRepMs) return false;
+  if (!P.tpl || !P.tpl.length) return true;
+  return calibPearson(calibResampleZ(trace, CALIB_TPL_N), P.tpl) >= P.minCorr;
+}
+
 /* ---------- App ---------- */
 function App() {
   const [routine, setRoutine] = useState(() => {
@@ -1348,6 +1502,15 @@ function App() {
     if (v) { try { const s = JSON.parse(v); if (Array.isArray(s)) return s; } catch (e) {} }
     return [];
   });
+  const [calibProfiles, setCalibProfiles] = useState(() => {
+    const v = STORE.get(CALIB_KEY);
+    if (v) { try { const c = JSON.parse(v); if (c && typeof c === "object") return c; } catch (e) {} }
+    return {};
+  });
+  const calibProfilesRef = useRef(calibProfiles);
+  const [calib, setCalib] = useState(null); // { exId, count } mientras se calibra
+  const calibRef = useRef(null);
+  const activeExIdRef = useRef(null);
   const [settings, setSettings] = useState(() => {
     const base = { globalRest: 90, autoRest: true, soundOn: true };
     const v = STORE.get("settings_v2");
@@ -1421,7 +1584,85 @@ function App() {
     recentAcel: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
     lastTimestamp: 0,
     _lastUiUpdate: 0,
+    repTrace: [],
   });
+
+  activeExIdRef.current = workout ? workout.exId : null;
+
+  useEffect(() => {
+    // pide al navegador que no borre automáticamente los datos (calibraciones incluidas)
+    try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch (e) {}
+  }, []);
+
+  function persistCalib(next) {
+    calibProfilesRef.current = next;
+    setCalibProfiles(next);
+    STORE.set(CALIB_KEY, JSON.stringify(next));
+  }
+  function calibStart(exId) {
+    resetSensorReps();
+    calibRef.current = { exId, samples: [], lastUi: 0 };
+    setCalib({ exId, count: 0 });
+    showToast("🎯 Calibrando: haz 3-5 repeticiones normales");
+  }
+  function calibCapture(now, f) {
+    const c = calibRef.current;
+    if (!c) return;
+    c.samples.push({ t: now, f });
+    if (c.samples.length > 6000) c.samples.shift();
+    if (now - c.lastUi > 250) {
+      c.lastUi = now;
+      setCalib({ exId: c.exId, count: calibSegmentBursts(c.samples, false).length });
+    }
+  }
+  function calibCancel() {
+    calibRef.current = null;
+    setCalib(null);
+    showToast("Calibración cancelada");
+  }
+  function calibFinish() {
+    const c = calibRef.current;
+    calibRef.current = null;
+    setCalib(null);
+    if (!c) return;
+    const res = calibBuildProfile(c.samples);
+    if (!res.ok) { showToast(res.msg); return; }
+    persistCalib({ ...calibProfilesRef.current, [c.exId]: res.profile });
+    showToast("✓ Calibración guardada (" + res.profile.reps + " reps)");
+  }
+  function calibReset(exId) {
+    const next = { ...calibProfilesRef.current };
+    delete next[exId];
+    persistCalib(next);
+    showToast("Calibración restablecida a valores por defecto");
+  }
+  function exportCalib() {
+    const data = JSON.stringify({ type: "mi-rutina-calib", v: 1, profiles: calibProfilesRef.current }, null, 2);
+    const url = URL.createObjectURL(new Blob([data], { type: "application/json" }));
+    const a = document.createElement("a");
+    a.href = url; a.download = "mi-rutina-calibracion.json";
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+  function importCalib() {
+    const inp = document.createElement("input");
+    inp.type = "file"; inp.accept = "application/json,.json";
+    inp.onchange = () => {
+      const f = inp.files && inp.files[0];
+      if (!f) return;
+      const r = new FileReader();
+      r.onload = () => {
+        try {
+          const d = JSON.parse(r.result);
+          if (!d || !d.profiles || typeof d.profiles !== "object") throw new Error("x");
+          persistCalib({ ...calibProfilesRef.current, ...d.profiles });
+          showToast("Calibración importada ✓");
+        } catch (e) { showToast("Archivo de calibración inválido"); }
+      };
+      r.readAsText(f);
+    };
+    inp.click();
+  }
 
   function clearTelemetry() {
     if (telemetryRef.current) {
@@ -1593,15 +1834,21 @@ function App() {
     if (wave.length > 24) wave.shift();
 
     const accLineal = fAcc * 9.80665;
-    const UMBRAL_BAJADA = -0.16;
-    const UMBRAL_SUBIDA = 0.18;
-    const UMBRAL_QUIETO = 0.07;
-    const MIN_REP_MS = 600;
+    const P = calibProfilesRef.current[activeExIdRef.current] || null;
+    const UMBRAL_BAJADA = P ? P.down : -0.16;
+    const UMBRAL_SUBIDA = P ? P.up : 0.18;
+    const UMBRAL_QUIETO = P ? P.quiet : 0.07;
+    const MIN_REP_MS = P ? P.minRepMs : 600;
     const REST_TRIGGER_MS = 3600;
 
     let phaseChanged = false;
 
-    switch (dsp.phase) {
+    if (calibRef.current) calibCapture(now, fAcc);
+    const prevPhase = dsp.phase;
+    if (prevPhase !== "IDLE") dsp.repTrace.push(fAcc);
+
+    // mientras se calibra no se cuentan reps
+    switch (calibRef.current ? "CALIB" : dsp.phase) {
       case "IDLE":
         dsp.vel = 0;
         dsp.maxVel = 0;
@@ -1649,7 +1896,11 @@ function App() {
         dsp.velSum += dsp.vel;
         dsp.velSamples++;
 
-        if (fAcc <= UMBRAL_QUIETO && now - dsp.repStartTime >= MIN_REP_MS) {
+        if (P && fAcc <= UMBRAL_QUIETO && now - dsp.repStartTime >= MIN_REP_MS && !calibMatches(P, dsp.repTrace, now - dsp.repStartTime)) {
+          // movimiento que no coincide con el patrón calibrado: se descarta
+          dsp.phase = "IDLE";
+          phaseChanged = true;
+        } else if (fAcc <= UMBRAL_QUIETO && now - dsp.repStartTime >= MIN_REP_MS) {
           dsp.repsCount++;
           const duration = (now - dsp.repStartTime) / 1000.0;
           const meanVel = dsp.velSamples > 0 ? dsp.velSum / dsp.velSamples : dsp.maxVel;
@@ -1678,6 +1929,8 @@ function App() {
         }
         break;
     }
+
+    if (prevPhase === "IDLE" && dsp.phase !== "IDLE") dsp.repTrace = [fAcc];
 
     if (phaseChanged || now - (dsp._lastUiUpdate || 0) > 80) {
       dsp._lastUiUpdate = now;
@@ -2467,6 +2720,12 @@ function App() {
           onStop={woStop}
           bleState={bleState}
           onConnectBle={connectBLE}
+          calib={calib}
+          calibProfile={calibProfiles[workoutEx.id] || null}
+          onCalibStart={() => calibStart(workoutEx.id)}
+          onCalibFinish={calibFinish}
+          onCalibCancel={calibCancel}
+          onCalibReset={() => calibReset(workoutEx.id)}
           onOpenSensorMonitor={() => setSensorMonitorOpen(true)}
           wavePoints={wavePoints}
         />
@@ -2487,6 +2746,9 @@ function App() {
           onStartDemo={startDemoTelemetry}
           onStopDemo={stopDemoTelemetry}
           onClearTelemetry={clearTelemetry}
+          calibCount={Object.keys(calibProfiles).length}
+          onExportCalib={exportCalib}
+          onImportCalib={importCalib}
         />
       )}
     </div>
@@ -2817,6 +3079,12 @@ input, textarea { font-family: inherit; }
 .hud-foot { font-size: 10px; font-weight: 600; color: var(--muted); text-align: center; }
 .ov-hud-view-btn { background: none; border: 1px solid rgba(45,127,249,.35); color: var(--blue); font-size: 11px; font-weight: 800; border-radius: 8px; padding: 5px 11px; cursor: pointer; transition: all .15s ease; }
 .ov-hud-view-btn:hover { background: rgba(45,127,249,.08); }
+.calib-box { width: 100%; background: var(--surface2); border-radius: 12px; padding: 9px 10px; margin: 2px 0 6px; display: flex; flex-direction: column; align-items: center; gap: 6px; }
+.calib-box.rec { background: rgba(255,122,69,.1); border: 1px solid rgba(255,122,69,.4); }
+.calib-title, .calib-status { font-size: 11.5px; font-weight: 800; color: var(--text); text-align: center; }
+.calib-count { font-size: 22px; font-weight: 900; color: var(--coral); font-variant-numeric: tabular-nums; }
+.calib-count span { font-size: 10.5px; font-weight: 700; color: var(--muted); margin-left: 4px; }
+.calib-btns { display: flex; gap: 8px; }
 
 .ov-sensor-prompt-box { display: flex; flex-direction: column; align-items: center; width: 100%; max-width: 360px; margin: 12px 0 16px; gap: 6px; }
 .ov-sensor-prompt {
