@@ -48,7 +48,7 @@
 </script>
 
 <script type="text/babel">
-const { useState, useEffect, useRef } = React;
+const { useState, useEffect, useRef, useMemo } = React;
 
 const STORE = {
   get(k) { try { const v = localStorage.getItem(k); return v == null ? null : v; } catch (e) { return null; } },
@@ -326,7 +326,7 @@ function DayForm({ initial, canDelete, onSave, onCancel, onDelete }) {
 }
 
 /* ---------- Modo entrenamiento (controlado) ---------- */
-function WorkoutOverlay({ ex, w, doneArr, nextEx, onComplete, onAdvance, onAddTime, onPauseResume, onSetReps, onClose, onNext, onFinish, onStop }) {
+function WorkoutOverlay({ ex, w, doneArr, nextEx, onComplete, onAdvance, onAddTime, onPauseResume, onSetReps, onClose, onNext, onFinish, onStop, bleState, onConnectBle, onOpenSensorMonitor, wavePoints }) {
   const [confirmStop, setConfirmStop] = useState(false);
   const total = ex.sets;
   const phase = w.phase;
@@ -375,6 +375,68 @@ function WorkoutOverlay({ ex, w, doneArr, nextEx, onComplete, onAdvance, onAddTi
             {fmtClock(elapsed)}
           </div>
           {ex.tip ? <div className="ov-tip">{ex.tip}</div> : null}
+
+          {bleState?.connected ? (
+            <div className="ov-hud rise-fast">
+              <div className="ov-hud-head">
+                <span className="ov-hud-badge">
+                  <span className="hud-live-dot" /> SENSOR VBT
+                </span>
+                <span className={"ov-hud-phase " + (bleState.phase || "idle").toLowerCase()}>
+                  {bleState.phase === "SUBIDA" ? "▲ SUBIENDO" : bleState.phase === "BAJADA" ? "▼ BAJANDO" : "● LISTO"}
+                </span>
+              </div>
+              <div className="ov-hud-grid">
+                <div className="hud-metric">
+                  <div className="hud-m-val">{bleState.reps}</div>
+                  <div className="hud-m-lbl">Reps sensor</div>
+                </div>
+                <div className="hud-metric highlight">
+                  <div className="hud-m-val">
+                    {bleState.lastMeanVel > 0 ? bleState.lastMeanVel.toFixed(2) : "—"}
+                    <span className="hud-unit">m/s</span>
+                  </div>
+                  <div className="hud-m-lbl">Vel. Media (VBT)</div>
+                </div>
+                <div className="hud-metric">
+                  <div className="hud-m-val">
+                    {bleState.lastPeakVel > 0 ? bleState.lastPeakVel.toFixed(2) : "—"}
+                    <span className="hud-unit">m/s</span>
+                  </div>
+                  <div className="hud-m-lbl">Vel. Pico</div>
+                </div>
+              </div>
+              {wavePoints && (
+                <div className="hud-wave-wrap">
+                  <svg className="hud-svg" viewBox="0 0 100 24" preserveAspectRatio="none">
+                    <line x1="0" y1="12" x2="100" y2="12" stroke="rgba(45,127,249,0.18)" strokeWidth="1" strokeDasharray="2,2" />
+                    <polyline points={wavePoints} fill="none" stroke="#2D7FF9" strokeWidth="2" strokeLinecap="round" />
+                  </svg>
+                </div>
+              )}
+              <div className="ov-hud-actions">
+                <span className="hud-foot">Barra inmóvil &gt; 3.5s inicia descanso automáticamente</span>
+                {onOpenSensorMonitor && (
+                  <button className="ov-hud-view-btn" onClick={onOpenSensorMonitor} type="button">
+                    📈 Ver osciloscopio completo
+                  </button>
+                )}
+              </div>
+            </div>
+          ) : (
+            <div className="ov-sensor-prompt-box">
+              <button className="ov-sensor-prompt" onClick={onConnectBle} type="button">
+                <span>📡 Conectar sensor XIAO BLE</span>
+                <span className="prompt-sub">Auto-conteo de reps y velocidad VBT en vivo</span>
+              </button>
+              {onOpenSensorMonitor && (
+                <button className="ov-sensor-monitor-link" onClick={onOpenSensorMonitor} type="button">
+                  📊 O abrir monitor gráfico (con Demo)
+                </button>
+              )}
+            </div>
+          )}
+
           <button className="ov-main" onClick={onComplete}>✓&nbsp; Serie completada</button>
         </div>
       )}
@@ -414,6 +476,18 @@ function WorkoutOverlay({ ex, w, doneArr, nextEx, onComplete, onAdvance, onAddTi
               {Array.from({ length: total }, (_, i) =>
                 durations[i] != null ? (<span key={i} className="ov-dur">S{i + 1} · {durations[i]}s</span>) : null
               )}
+            </div>
+          )}
+          {bleState?.history?.length > 0 && (
+            <div className="ov-vbt-summary">
+              <div className="vbt-sum-title">⚡ Resumen de velocidad VBT</div>
+              <div className="vbt-reps-list">
+                {bleState.history.slice(-total).map((h, idx) => (
+                  <span key={idx} className="vbt-rep-chip">
+                    R{h.rep}: <b>{h.meanVel.toFixed(2)} m/s</b> ({h.dur.toFixed(1)}s)
+                  </span>
+                ))}
+              </div>
             </div>
           )}
           <div className="ov-reps">
@@ -558,6 +632,703 @@ function SessionsScreen({ sessions, onClose, onExport, onClear }) {
   );
 }
 
+/* ---------- Monitor Gráfico de Sensores Seeed Studio ---------- */
+function SensorMonitorModal({
+  bleState,
+  telemetryRef,
+  onConnect,
+  onDisconnect,
+  onClose,
+  isDemo,
+  onStartDemo,
+  onStopDemo,
+  onClearTelemetry,
+}) {
+  const [activeTab, setActiveTab] = useState("chart"); // 'chart' | '3d' | 'kpis' | 'info'
+  const [chartMode, setChartMode] = useState("accel"); // 'accel' | 'gyro' | 'dual'
+  const [axes, setAxes] = useState({ ax: true, ay: true, az: true, mag: true, gx: true, gy: true, gz: true, gMag: true });
+  const [timeWindow, setTimeWindow] = useState(5); // 3, 5, 10 segundos
+  const [isPaused, setIsPaused] = useState(false);
+  const [copiedUuid, setCopiedUuid] = useState(false);
+
+  // Valores numéricos instantáneos para medidores y 3D
+  const [cur, setCur] = useState({
+    ax: 0, ay: 0, az: 0, mag: 1, netAcc: 0,
+    gx: 0, gy: 0, gz: 0, gMag: 0,
+    pitch: 0, roll: 0, hz: 0, packetCount: 0
+  });
+
+  const canvasRef = useRef(null);
+  const animIdRef = useRef(null);
+
+  // Sincronización del estado de pausa en la ref para el loop del canvas
+  const pausedRef = useRef(false);
+  pausedRef.current = isPaused;
+
+  // Actualizador para datos numéricos y orientación (a ~16 Hz para suavidad)
+  useEffect(() => {
+    const timer = setInterval(() => {
+      const tel = telemetryRef.current;
+      if (!tel) return;
+      const history = tel.history;
+      const last = history && history.length > 0 ? history[history.length - 1] : null;
+      if (last) {
+        setCur({
+          ax: last.ax || 0,
+          ay: last.ay || 0,
+          az: last.az || 0,
+          mag: last.mag || 1,
+          netAcc: last.netAcc || 0,
+          gx: last.gx || 0,
+          gy: last.gy || 0,
+          gz: last.gz || 0,
+          gMag: last.gMag || 0,
+          pitch: last.pitch || 0,
+          roll: last.roll || 0,
+          hz: tel.hz || 0,
+          packetCount: tel.packetCount || 0
+        });
+      } else {
+        setCur((c) => ({ ...c, hz: tel.hz || 0, packetCount: tel.packetCount || 0 }));
+      }
+    }, 60);
+    return () => clearInterval(timer);
+  }, [telemetryRef]);
+
+  // Dibujado del Osciloscopio a 60 FPS con Canvas HiDPI
+  useEffect(() => {
+    if (activeTab !== "chart") return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    let running = true;
+
+    function render() {
+      if (!running) return;
+      animIdRef.current = requestAnimationFrame(render);
+
+      // Adaptación HiDPI
+      const rect = canvas.getBoundingClientRect();
+      const dpr = window.devicePixelRatio || 1;
+      const w = Math.floor(rect.width * dpr);
+      const h = Math.floor(rect.height * dpr);
+      if (canvas.width !== w || canvas.height !== h) {
+        canvas.width = w;
+        canvas.height = h;
+      }
+
+      ctx.save();
+      ctx.scale(dpr, dpr);
+      const cw = rect.width;
+      const ch = rect.height;
+
+      // Fondo oscuro de laboratorio
+      ctx.fillStyle = "#0A0F1D";
+      ctx.fillRect(0, 0, cw, ch);
+
+      // Rejilla de osciloscopio
+      ctx.strokeStyle = "rgba(255, 255, 255, 0.05)";
+      ctx.lineWidth = 1;
+      const gridGap = 28;
+      for (let x = 0; x < cw; x += gridGap) {
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, ch);
+        ctx.stroke();
+      }
+      for (let y = 0; y < ch; y += gridGap) {
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(cw, y);
+        ctx.stroke();
+      }
+
+      const tel = telemetryRef.current;
+      const history = tel ? tel.history : [];
+      const samplesToShow = Math.round(timeWindow * 40);
+      const dataSlice = history.slice(-samplesToShow);
+
+      if (chartMode === "dual") {
+        renderSection(ctx, dataSlice, 0, ch / 2, cw, "accel");
+        renderSection(ctx, dataSlice, ch / 2, ch / 2, cw, "gyro");
+      } else {
+        renderSection(ctx, dataSlice, 0, ch, cw, chartMode);
+      }
+
+      ctx.restore();
+    }
+
+    function renderSection(ctx, data, topY, height, width, mode) {
+      const centerY = topY + height / 2;
+      const isAccel = mode === "accel";
+
+      // Línea de cero central
+      ctx.strokeStyle = "rgba(255, 255, 255, 0.2)";
+      ctx.lineWidth = 1.2;
+      ctx.setLineDash([4, 4]);
+      ctx.beginPath();
+      ctx.moveTo(0, centerY);
+      ctx.lineTo(width, centerY);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      ctx.fillStyle = "rgba(148, 163, 184, 0.75)";
+      ctx.font = "10px Inter, monospace";
+      ctx.textAlign = "left";
+
+      if (isAccel) {
+        const rangeG = 2.5;
+        const scaleY = (height / 2) / rangeG;
+
+        [2.0, 1.0, -1.0, -2.0].forEach((gVal) => {
+          const y = centerY - gVal * scaleY;
+          if (y >= topY && y <= topY + height) {
+            ctx.strokeStyle = "rgba(255, 255, 255, 0.07)";
+            ctx.beginPath();
+            ctx.moveTo(0, y);
+            ctx.lineTo(width, y);
+            ctx.stroke();
+            ctx.fillText((gVal > 0 ? "+" : "") + gVal.toFixed(1) + "G", 6, y - 3);
+          }
+        });
+        ctx.fillText("0G", 6, centerY - 3);
+
+        ctx.fillStyle = "#94A3B8";
+        ctx.font = "bold 11px Inter, sans-serif";
+        ctx.fillText("ACELERÓMETRO (G)", width - 135, topY + 16);
+
+        if (data.length > 1) {
+          if (axes.mag) drawLine(ctx, data, (d) => centerY - d.mag * scaleY, "#F59E0B", width);
+          if (axes.az) drawLine(ctx, data, (d) => centerY - d.az * scaleY, "#38BDF8", width);
+          if (axes.ay) drawLine(ctx, data, (d) => centerY - d.ay * scaleY, "#10B981", width);
+          if (axes.ax) drawLine(ctx, data, (d) => centerY - d.ax * scaleY, "#FF5555", width);
+        }
+      } else {
+        const rangeDps = 500;
+        const scaleY = (height / 2) / rangeDps;
+
+        [250, -250].forEach((degVal) => {
+          const y = centerY - degVal * scaleY;
+          if (y >= topY && y <= topY + height) {
+            ctx.strokeStyle = "rgba(255, 255, 255, 0.07)";
+            ctx.beginPath();
+            ctx.moveTo(0, y);
+            ctx.lineTo(width, y);
+            ctx.stroke();
+            ctx.fillText((degVal > 0 ? "+" : "") + degVal + "°/s", 6, y - 3);
+          }
+        });
+        ctx.fillText("0°/s", 6, centerY - 3);
+
+        ctx.fillStyle = "#94A3B8";
+        ctx.font = "bold 11px Inter, sans-serif";
+        ctx.fillText("GIROSCOPIO (°/s)", width - 125, topY + 16);
+
+        if (data.length > 1) {
+          if (axes.gMag) drawLine(ctx, data, (d) => centerY - d.gMag * scaleY, "#F59E0B", width);
+          if (axes.gz) drawLine(ctx, data, (d) => centerY - d.gz * scaleY, "#F43F5E", width);
+          if (axes.gy) drawLine(ctx, data, (d) => centerY - d.gy * scaleY, "#06B6D4", width);
+          if (axes.gx) drawLine(ctx, data, (d) => centerY - d.gx * scaleY, "#A855F7", width);
+        }
+      }
+    }
+
+    function drawLine(ctx, data, getY, color, width) {
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2;
+      ctx.lineJoin = "round";
+      ctx.lineCap = "round";
+      ctx.shadowColor = color;
+      ctx.shadowBlur = 4;
+      ctx.beginPath();
+
+      const stepX = width / Math.max(data.length - 1, 1);
+      data.forEach((d, i) => {
+        const x = i * stepX;
+        const y = getY(d);
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      });
+      ctx.stroke();
+      ctx.shadowBlur = 0;
+
+      // Punto en la última muestra a la derecha
+      if (data.length > 0) {
+        const lastD = data[data.length - 1];
+        const lastX = (data.length - 1) * stepX;
+        const lastY = getY(lastD);
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        ctx.arc(lastX, lastY, 3.5, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+
+    render();
+
+    return () => {
+      running = false;
+      if (animIdRef.current) cancelAnimationFrame(animIdRef.current);
+    };
+  }, [activeTab, chartMode, axes, timeWindow]);
+
+  function toggleAxis(k) {
+    setAxes((a) => ({ ...a, [k]: !a[k] }));
+  }
+
+  function handleCopyUuid() {
+    try {
+      navigator.clipboard.writeText("19b10000-e8f2-537e-4f6c-d104768a1214");
+      setCopiedUuid(true);
+      setTimeout(() => setCopiedUuid(false), 2000);
+    } catch (e) {}
+  }
+
+  function exportCSV() {
+    const history = telemetryRef.current?.history || [];
+    if (history.length === 0) {
+      alert("Aún no hay datos acumulados para exportar.");
+      return;
+    }
+    const header = "Timestamp_ms,Ax_G,Ay_G,Az_G,Mag_G,Gx_dps,Gy_dps,Gz_dps,Pitch_deg,Roll_deg";
+    const rows = history.map((s) =>
+      [s.t, s.ax.toFixed(4), s.ay.toFixed(4), s.az.toFixed(4), s.mag.toFixed(4), s.gx, s.gy, s.gz, s.pitch.toFixed(1), s.roll.toFixed(1)].join(",")
+    );
+    const csv = "\uFEFF" + [header].concat(rows).join("\r\n");
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `seeed-telemetria-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+  }
+
+  // Burbuja para el nivel digital (clamp en +/- 42px)
+  const bubbleX = Math.max(-42, Math.min(42, (cur.roll / 45) * 42));
+  const bubbleY = Math.max(-42, Math.min(42, (-cur.pitch / 45) * 42));
+
+  // Ayudante de barra bipolar (-val a +val con centro al 50%)
+  function renderBipolarBar(val, maxRange, color) {
+    const clamped = Math.max(-maxRange, Math.min(maxRange, val));
+    const pct = Math.abs(clamped / maxRange) * 50;
+    const isPos = clamped >= 0;
+    return (
+      <div className="bipolar-track">
+        <div className="bipolar-center-line" />
+        <div
+          className="bipolar-fill"
+          style={{
+            left: isPos ? "50%" : `${50 - pct}%`,
+            width: `${pct}%`,
+            background: color,
+          }}
+        />
+      </div>
+    );
+  }
+
+  return (
+    <div className="sensor-modal-backdrop" onClick={onClose}>
+      <div className="sensor-modal rise" onClick={(e) => e.stopPropagation()}>
+        {/* Encabezado */}
+        <div className="sensor-head">
+          <div className="sensor-head-info">
+            <div className="sensor-head-title">
+              <span className="sensor-chip-icon">⚡</span>
+              <span>Telemetría Seeed Studio</span>
+              <span className="sensor-chip-model">XIAO BLE Sense</span>
+            </div>
+            <div className="sensor-status-bar">
+              {bleState.connected ? (
+                <span className="sensor-badge on">
+                  <span className="s-dot on" /> CONECTADO ({bleState.deviceName || "MiRutina"})
+                </span>
+              ) : isDemo ? (
+                <span className="sensor-badge demo">
+                  <span className="s-dot demo" /> MODO DEMO ACTIVO (~40 Hz)
+                </span>
+              ) : bleState.connecting ? (
+                <span className="sensor-badge busy">
+                  <span className="s-dot busy" /> BUSCANDO BLE...
+                </span>
+              ) : (
+                <span className="sensor-badge off">
+                  <span className="s-dot off" /> DESCONECTADO
+                </span>
+              )}
+              <span className="sensor-rate-text">
+                {cur.hz > 0 ? `${cur.hz} Hz` : "0 Hz"} · {cur.packetCount.toLocaleString()} paquetes
+              </span>
+            </div>
+          </div>
+          <div className="sensor-head-actions">
+            {bleState.connected ? (
+              <button className="s-btn danger" onClick={onDisconnect}>Desconectar</button>
+            ) : (
+              <button className="s-btn primary" onClick={onConnect} disabled={bleState.connecting}>
+                {bleState.connecting ? "Conectando..." : "📡 Conectar BLE"}
+              </button>
+            )}
+            <button className="s-close-btn" onClick={onClose} aria-label="Cerrar">✕</button>
+          </div>
+        </div>
+
+        {/* Pestañas */}
+        <div className="sensor-tabs">
+          <button className={"s-tab" + (activeTab === "chart" ? " active" : "")} onClick={() => setActiveTab("chart")}>
+            📈 Osciloscopio
+          </button>
+          <button className={"s-tab" + (activeTab === "3d" ? " active" : "")} onClick={() => setActiveTab("3d")}>
+            🧊 Orientación 3D
+          </button>
+          <button className={"s-tab" + (activeTab === "kpis" ? " active" : "")} onClick={() => setActiveTab("kpis")}>
+            📊 Medidores
+          </button>
+          <button className={"s-tab" + (activeTab === "info" ? " active" : "")} onClick={() => setActiveTab("info")}>
+            ℹ️ Diagnóstico
+          </button>
+        </div>
+
+        {/* Contenido según pestaña */}
+        {activeTab === "chart" && (
+          <div className="sensor-view-body">
+            {/* Barra de controles del Osciloscopio */}
+            <div className="sensor-chart-toolbar">
+              <div className="s-tgroup">
+                <span className="s-lbl">Modo:</span>
+                <button className={"s-pill" + (chartMode === "accel" ? " on" : "")} onClick={() => setChartMode("accel")}>Acelerómetro</button>
+                <button className={"s-pill" + (chartMode === "gyro" ? " on" : "")} onClick={() => setChartMode("gyro")}>Giroscopio</button>
+                <button className={"s-pill" + (chartMode === "dual" ? " on" : "")} onClick={() => setChartMode("dual")}>Dual</button>
+              </div>
+
+              <div className="s-tgroup">
+                <span className="s-lbl">Ventana:</span>
+                {[3, 5, 10].map((sec) => (
+                  <button key={sec} className={"s-pill" + (timeWindow === sec ? " on" : "")} onClick={() => setTimeWindow(sec)}>
+                    {sec}s
+                  </button>
+                ))}
+              </div>
+
+              <div className="s-tgroup right">
+                <button className={"s-tool-btn" + (isPaused ? " active" : "")} onClick={() => {
+                  const next = !isPaused;
+                  setIsPaused(next);
+                  if (telemetryRef.current) telemetryRef.current.paused = next;
+                }}>
+                  {isPaused ? "▶ Reanudar" : "⏸ Congelar"}
+                </button>
+                <button className="s-tool-btn" onClick={onClearTelemetry} title="Limpiar trazado">🗑 Limpiar</button>
+              </div>
+            </div>
+
+            {/* Canvas Osciloscopio */}
+            <div className="sensor-canvas-wrapper">
+              <canvas ref={canvasRef} className="sensor-canvas" />
+            </div>
+
+            {/* Selector de ejes con colores */}
+            <div className="sensor-legend-bar">
+              {(chartMode === "accel" || chartMode === "dual") && (
+                <div className="sensor-legend-group">
+                  <span className="sensor-legend-group-title">Acel:</span>
+                  <button className={"s-axis-chip" + (axes.ax ? " on" : "")} style={{ "--ax-col": "#FF5555" }} onClick={() => toggleAxis("ax")}>
+                    <span className="s-axis-dot" /> Ax ({cur.ax.toFixed(2)}G)
+                  </button>
+                  <button className={"s-axis-chip" + (axes.ay ? " on" : "")} style={{ "--ax-col": "#10B981" }} onClick={() => toggleAxis("ay")}>
+                    <span className="s-axis-dot" /> Ay ({cur.ay.toFixed(2)}G)
+                  </button>
+                  <button className={"s-axis-chip" + (axes.az ? " on" : "")} style={{ "--ax-col": "#38BDF8" }} onClick={() => toggleAxis("az")}>
+                    <span className="s-axis-dot" /> Az ({cur.az.toFixed(2)}G)
+                  </button>
+                  <button className={"s-axis-chip" + (axes.mag ? " on" : "")} style={{ "--ax-col": "#F59E0B" }} onClick={() => toggleAxis("mag")}>
+                    <span className="s-axis-dot" /> |A| ({cur.mag.toFixed(2)}G)
+                  </button>
+                </div>
+              )}
+
+              {(chartMode === "gyro" || chartMode === "dual") && (
+                <div className="sensor-legend-group">
+                  <span className="sensor-legend-group-title">Giro:</span>
+                  <button className={"s-axis-chip" + (axes.gx ? " on" : "")} style={{ "--ax-col": "#A855F7" }} onClick={() => toggleAxis("gx")}>
+                    <span className="s-axis-dot" /> Gx ({cur.gx}°/s)
+                  </button>
+                  <button className={"s-axis-chip" + (axes.gy ? " on" : "")} style={{ "--ax-col": "#06B6D4" }} onClick={() => toggleAxis("gy")}>
+                    <span className="s-axis-dot" /> Gy ({cur.gy}°/s)
+                  </button>
+                  <button className={"s-axis-chip" + (axes.gz ? " on" : "")} style={{ "--ax-col": "#F43F5E" }} onClick={() => toggleAxis("gz")}>
+                    <span className="s-axis-dot" /> Gz ({cur.gz}°/s)
+                  </button>
+                  <button className={"s-axis-chip" + (axes.gMag ? " on" : "")} style={{ "--ax-col": "#F59E0B" }} onClick={() => toggleAxis("gMag")}>
+                    <span className="s-axis-dot" /> |G| ({cur.gMag.toFixed(0)}°/s)
+                  </button>
+                </div>
+              )}
+            </div>
+
+            {/* Aviso si no hay señal */}
+            {!bleState.connected && !isDemo && (
+              <div className="sensor-idle-card">
+                <div className="sensor-idle-text">
+                  <span>📡 Para ver datos reales en movimiento, conecta tu <b>Seeed Studio XIAO BLE Sense</b> o activa una simulación:</span>
+                </div>
+                <div className="sensor-idle-btns">
+                  <button className="s-btn primary" onClick={onConnect}>Conectar BLE</button>
+                  <button className="s-btn secondary" onClick={onStartDemo}>Probar con Simulación (Demo)</button>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {activeTab === "3d" && (
+          <div className="sensor-view-body">
+            <div className="sensor-3d-layout">
+              {/* Modelo de la placa Seeed Studio XIAO en 3D */}
+              <div className="sensor-3d-card">
+                <div className="sensor-card-head">Orientación Espacial 3D (XIAO Sense)</div>
+                <div className="sensor-scene-3d">
+                  <div
+                    className="xiao-board-3d"
+                    style={{
+                      transform: `rotateX(${-cur.pitch.toFixed(1)}deg) rotateZ(${cur.roll.toFixed(1)}deg)`,
+                    }}
+                  >
+                    {/* Detalles visuales de la placa */}
+                    <div className="xiao-usbc-port" />
+                    <div className="xiao-chip-label">Seeed Studio</div>
+                    <div className="xiao-chip-main">
+                      <span>nRF52840</span>
+                      <small>SENSE</small>
+                    </div>
+                    <div className="xiao-imu-chip">LSM6DS3</div>
+                    <div className={"xiao-rgb-led" + (bleState.connected || isDemo ? " blinking" : "")} />
+                    <div className="xiao-antenna" />
+                    <div className="xiao-pins-left">
+                      {[1, 2, 3, 4, 5, 6, 7].map((p) => (<span key={p} className="xiao-pin" />))}
+                    </div>
+                    <div className="xiao-pins-right">
+                      {[1, 2, 3, 4, 5, 6, 7].map((p) => (<span key={p} className="xiao-pin" />))}
+                    </div>
+                  </div>
+                </div>
+                <div className="xiao-3d-hint">Gira e inclina tu sensor físico para ver la placa rotar en vivo</div>
+              </div>
+
+              {/* Horizonte artificial / Nivel de burbuja digital */}
+              <div className="sensor-horizon-card">
+                <div className="sensor-card-head">Nivel Digital y Ángulos</div>
+                <div className="level-wrapper">
+                  <div className="bubble-circle">
+                    <div className="bubble-cross-x" />
+                    <div className="bubble-cross-y" />
+                    <div className="bubble-ring-center" />
+                    <div
+                      className="bubble-dot"
+                      style={{
+                        transform: `translate(calc(-50% + ${bubbleX.toFixed(1)}px), calc(-50% + ${bubbleY.toFixed(1)}px))`,
+                      }}
+                    />
+                  </div>
+                  <div className="level-angles">
+                    <div className="level-angle-item">
+                      <span className="level-angle-lbl">Pitch (Inclinación frontal)</span>
+                      <span className="level-angle-val">{cur.pitch > 0 ? "+" : ""}{cur.pitch.toFixed(1)}°</span>
+                    </div>
+                    <div className="level-angle-item">
+                      <span className="level-angle-lbl">Roll (Inclinación lateral)</span>
+                      <span className="level-angle-val">{cur.roll > 0 ? "+" : ""}{cur.roll.toFixed(1)}°</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {activeTab === "kpis" && (
+          <div className="sensor-view-body">
+            <div className="sensor-gauges-section">
+              {/* Sección Acelerómetro */}
+              <div className="sensor-kpi-block">
+                <div className="sensor-block-title">Acelerómetro LSM6DS3 (G)</div>
+                <div className="sensor-gauge-rows">
+                  <div className="gauge-row">
+                    <div className="gauge-row-info">
+                      <span className="gauge-lbl" style={{ color: "#FF5555" }}>Eje X (Ax)</span>
+                      <span className="gauge-val">{cur.ax > 0 ? "+" : ""}{cur.ax.toFixed(3)} G</span>
+                    </div>
+                    {renderBipolarBar(cur.ax, 2.0, "#FF5555")}
+                  </div>
+
+                  <div className="gauge-row">
+                    <div className="gauge-row-info">
+                      <span className="gauge-lbl" style={{ color: "#10B981" }}>Eje Y (Ay)</span>
+                      <span className="gauge-val">{cur.ay > 0 ? "+" : ""}{cur.ay.toFixed(3)} G</span>
+                    </div>
+                    {renderBipolarBar(cur.ay, 2.0, "#10B981")}
+                  </div>
+
+                  <div className="gauge-row">
+                    <div className="gauge-row-info">
+                      <span className="gauge-lbl" style={{ color: "#38BDF8" }}>Eje Z (Az)</span>
+                      <span className="gauge-val">{cur.az > 0 ? "+" : ""}{cur.az.toFixed(3)} G</span>
+                    </div>
+                    {renderBipolarBar(cur.az, 2.0, "#38BDF8")}
+                  </div>
+
+                  <div className="gauge-row highlight">
+                    <div className="gauge-row-info">
+                      <span className="gauge-lbl" style={{ color: "#F59E0B" }}>Magnitud Total |A|</span>
+                      <span className="gauge-val">{cur.mag.toFixed(3)} G</span>
+                    </div>
+                    {renderBipolarBar(cur.mag - 1.0, 1.5, "#F59E0B")}
+                  </div>
+                </div>
+              </div>
+
+              {/* Sección Giroscopio */}
+              <div className="sensor-kpi-block">
+                <div className="sensor-block-title">Giroscopio LSM6DS3 (°/s)</div>
+                <div className="sensor-gauge-rows">
+                  <div className="gauge-row">
+                    <div className="gauge-row-info">
+                      <span className="gauge-lbl" style={{ color: "#A855F7" }}>Eje X (Gx)</span>
+                      <span className="gauge-val">{cur.gx > 0 ? "+" : ""}{cur.gx} °/s</span>
+                    </div>
+                    {renderBipolarBar(cur.gx, 400, "#A855F7")}
+                  </div>
+
+                  <div className="gauge-row">
+                    <div className="gauge-row-info">
+                      <span className="gauge-lbl" style={{ color: "#06B6D4" }}>Eje Y (Gy)</span>
+                      <span className="gauge-val">{cur.gy > 0 ? "+" : ""}{cur.gy} °/s</span>
+                    </div>
+                    {renderBipolarBar(cur.gy, 400, "#06B6D4")}
+                  </div>
+
+                  <div className="gauge-row">
+                    <div className="gauge-row-info">
+                      <span className="gauge-lbl" style={{ color: "#F43F5E" }}>Eje Z (Gz)</span>
+                      <span className="gauge-val">{cur.gz > 0 ? "+" : ""}{cur.gz} °/s</span>
+                    </div>
+                    {renderBipolarBar(cur.gz, 400, "#F43F5E")}
+                  </div>
+
+                  <div className="gauge-row highlight">
+                    <div className="gauge-row-info">
+                      <span className="gauge-lbl" style={{ color: "#F59E0B" }}>Rotación Total |G|</span>
+                      <span className="gauge-val">{cur.gMag.toFixed(1)} °/s</span>
+                    </div>
+                    {renderBipolarBar(cur.gMag, 500, "#F59E0B")}
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Tarjeta VBT y Métricas de Repetición */}
+            <div className="sensor-vbt-card">
+              <div className="sensor-block-title">Algoritmo VBT & Repeticiones</div>
+              <div className="sensor-vbt-grid">
+                <div className="vbt-grid-item">
+                  <span className="vbt-sub">Fase actual</span>
+                  <span className={"vbt-phase-pill " + (bleState.phase || "idle").toLowerCase()}>
+                    {bleState.phase === "SUBIDA" ? "▲ SUBIDA (Concéntrica)" : bleState.phase === "BAJADA" ? "▼ BAJADA (Excéntrica)" : "● EN REPOSO"}
+                  </span>
+                </div>
+                <div className="vbt-grid-item">
+                  <span className="vbt-sub">Reps detectadas</span>
+                  <span className="vbt-big-num">{bleState.reps || 0}</span>
+                </div>
+                <div className="vbt-grid-item">
+                  <span className="vbt-sub">Vel. Media VBT</span>
+                  <span className="vbt-big-num">{bleState.lastMeanVel > 0 ? bleState.lastMeanVel.toFixed(2) : "—"} <small>m/s</small></span>
+                </div>
+                <div className="vbt-grid-item">
+                  <span className="vbt-sub">Vel. Pico</span>
+                  <span className="vbt-big-num">{bleState.lastPeakVel > 0 ? bleState.lastPeakVel.toFixed(2) : "—"} <small>m/s</small></span>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {activeTab === "info" && (
+          <div className="sensor-view-body info">
+            <div className="sensor-info-card">
+              <div className="sensor-card-head">Información de Conexión BLE</div>
+              <div className="info-grid">
+                <div className="info-row">
+                  <span className="info-k">Hardware IMU:</span>
+                  <span className="info-v">ST LSM6DS3 (Acelerómetro 3D + Giroscopio 3D)</span>
+                </div>
+                <div className="info-row">
+                  <span className="info-k">Placa recomendada:</span>
+                  <span className="info-v">Seeed Studio XIAO nRF52840 Sense</span>
+                </div>
+                <div className="info-row">
+                  <span className="info-k">Nombre Bluetooth:</span>
+                  <span className="info-v font-mono">MiRutina</span>
+                </div>
+                <div className="info-row">
+                  <span className="info-k">Service UUID:</span>
+                  <span className="info-v font-mono">
+                    19b10000-e8f2-537e-4f6c-d104768a1214
+                    <button className="copy-btn" onClick={handleCopyUuid}>{copiedUuid ? "✓ Copiado" : "Copiar"}</button>
+                  </span>
+                </div>
+                <div className="info-row">
+                  <span className="info-k">Char Raw UUID:</span>
+                  <span className="info-v font-mono">19b10001-e8f2-537e-4f6c-d104768a1214</span>
+                </div>
+                <div className="info-row">
+                  <span className="info-k">Formato de paquete:</span>
+                  <span className="info-v">12 bytes compactos (Ax, Ay, Az, Gx, Gy, Gz en int16_t Little-Endian)</span>
+                </div>
+                <div className="info-row">
+                  <span className="info-k">Frecuencia objetivo:</span>
+                  <span className="info-v">40 Hz (paquete cada 25 ms)</span>
+                </div>
+              </div>
+            </div>
+
+            <div className="sensor-info-card">
+              <div className="sensor-card-head">Exportación y Diagnóstico</div>
+              <p className="info-desc">
+                Puedes descargar todas las muestras registradas durante esta sesión para analizarlas en Excel, Python o MATLAB:
+              </p>
+              <div className="info-actions">
+                <button className="s-btn primary" onClick={exportCSV}>⬇ Descargar datos a CSV</button>
+                {isDemo ? (
+                  <button className="s-btn danger" onClick={onStopDemo}>Detener Modo Demo</button>
+                ) : (
+                  <button className="s-btn secondary" onClick={onStartDemo}>Iniciar Simulación Demo</button>
+                )}
+              </div>
+            </div>
+
+            <div className="sensor-info-card">
+              <div className="sensor-card-head">Guía rápida de conexión</div>
+              <ol className="sensor-guide-list">
+                <li>Abre el proyecto en Arduino IDE usando el archivo <code>firmware/MiRutina_Sensor_Stream/MiRutina_Sensor_Stream.ino</code>.</li>
+                <li>Selecciona la placa <b>Seeed XIAO BLE - nRF52840 Sense</b> y sube el firmware.</li>
+                <li>El LED azul del XIAO se encenderá indicando que está anunciando por Bluetooth.</li>
+                <li>En esta página web (usando Google Chrome o Microsoft Edge en PC o Android), presiona <b>Conectar BLE</b> y selecciona <b>MiRutina</b>.</li>
+                <li>El LED del XIAO pasará a verde fijo y las ondas en vivo se verán en este osciloscopio en tiempo real.</li>
+              </ol>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 /* ---------- App ---------- */
 function App() {
   const [routine, setRoutine] = useState(() => {
@@ -605,6 +1376,332 @@ function App() {
   const [workout, setWorkout] = useState(null);
   const [overlayOpen, setOverlayOpen] = useState(false);
   const [, setNow] = useState(0);
+
+  /* ---- Estado y DSP del Sensor Bluetooth XIAO ---- */
+  const [sensorMonitorOpen, setSensorMonitorOpen] = useState(false);
+  const [isDemoMode, setIsDemoMode] = useState(false);
+  const demoIntervalRef = useRef(null);
+
+  const telemetryRef = useRef({
+    history: [],
+    maxSamples: 450,
+    paused: false,
+    packetCount: 0,
+    hz: 0,
+    lastHzTime: Date.now(),
+    hzPackets: 0,
+  });
+
+  const [bleState, setBleState] = useState({
+    connected: false,
+    connecting: false,
+    deviceName: "",
+    raw: { ax: 0, ay: 0, az: 0, gx: 0, gy: 0, gz: 0, mag: 1, netAcc: 0 },
+    phase: "IDLE",
+    reps: 0,
+    lastMeanVel: 0,
+    lastPeakVel: 0,
+    lastDuration: 0,
+    history: [],
+  });
+
+  const bleDeviceRef = useRef(null);
+  const bleCharRef = useRef(null);
+  const dspRef = useRef({
+    filteredAcc: 0,
+    phase: "IDLE",
+    repStartTime: 0,
+    concentricStartTime: 0,
+    lastMovementTime: Date.now(),
+    repsCount: 0,
+    vel: 0,
+    maxVel: 0,
+    velSum: 0,
+    velSamples: 0,
+    recentAcel: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    lastTimestamp: 0,
+    _lastUiUpdate: 0,
+  });
+
+  function clearTelemetry() {
+    if (telemetryRef.current) {
+      telemetryRef.current.history = [];
+      telemetryRef.current.packetCount = 0;
+      telemetryRef.current.hzPackets = 0;
+      telemetryRef.current.hz = 0;
+    }
+    showToast("Datos de telemetría reiniciados");
+  }
+
+  function startDemoTelemetry() {
+    if (demoIntervalRef.current) return;
+    setIsDemoMode(true);
+    let step = 0;
+    demoIntervalRef.current = setInterval(() => {
+      step += 0.085;
+      const noiseA = (Math.random() - 0.5) * 0.035;
+      const noiseG = (Math.random() - 0.5) * 5;
+      const ax = Math.sin(step * 0.7) * 0.16 + noiseA;
+      const ay = Math.sin(step * 0.5) * 0.11 + noiseA;
+      const az = 1.0 + Math.sin(step) * 0.48 + noiseA;
+      const gx = Math.round(Math.cos(step) * 45 + noiseG);
+      const gy = Math.round(Math.sin(step * 0.8) * 32 + noiseG);
+      const gz = Math.round(Math.sin(step * 1.2) * 18 + noiseG);
+      processSensorSample(ax, ay, az, gx, gy, gz);
+    }, 25);
+    showToast("🎮 Modo Demo iniciado (~40 Hz)");
+  }
+
+  function stopDemoTelemetry() {
+    if (demoIntervalRef.current) {
+      clearInterval(demoIntervalRef.current);
+      demoIntervalRef.current = null;
+    }
+    setIsDemoMode(false);
+    showToast("Modo Demo detenido");
+  }
+
+  function resetSensorReps() {
+    dspRef.current.repsCount = 0;
+    dspRef.current.phase = "IDLE";
+    dspRef.current.lastMovementTime = Date.now();
+    dspRef.current.vel = 0;
+    dspRef.current.maxVel = 0;
+    dspRef.current.velSum = 0;
+    dspRef.current.velSamples = 0;
+    setBleState((s) => ({ ...s, reps: 0, phase: "IDLE" }));
+  }
+
+  const wavePoints = useMemo(() => {
+    const arr = dspRef.current.recentAcel || [];
+    if (arr.length < 2) return "0,12 100,12";
+    return arr
+      .map((v, i) => {
+        const x = (i / (arr.length - 1)) * 100;
+        const y = Math.max(2, Math.min(22, 12 - v * 18));
+        return `${x.toFixed(1)},${y.toFixed(1)}`;
+      })
+      .join(" ");
+  }, [bleState.raw]);
+
+  async function connectBLE() {
+    if (!navigator.bluetooth) {
+      showToast("Web Bluetooth no disponible en este navegador");
+      alert("Para conectar el sensor por Web Bluetooth, utiliza Google Chrome o Microsoft Edge (en PC o Android), o la app Bluefy en iPhone.");
+      return;
+    }
+    try {
+      if (demoIntervalRef.current) {
+        clearInterval(demoIntervalRef.current);
+        demoIntervalRef.current = null;
+        setIsDemoMode(false);
+      }
+      setBleState((s) => ({ ...s, connecting: true }));
+      showToast("Buscando 'MiRutina'...");
+      const device = await navigator.bluetooth.requestDevice({
+        acceptAllDevices: true,
+        optionalServices: ["19b10000-e8f2-537e-4f6c-d104768a1214"],
+      });
+
+      device.addEventListener("gattserverdisconnected", () => {
+        bleDeviceRef.current = null;
+        bleCharRef.current = null;
+        setBleState((s) => ({ ...s, connected: false, connecting: false, deviceName: "" }));
+        showToast("Sensor desconectado");
+      });
+
+      const server = await device.gatt.connect();
+      const service = await server.getPrimaryService("19b10000-e8f2-537e-4f6c-d104768a1214");
+      const char = await service.getCharacteristic("19b10001-e8f2-537e-4f6c-d104768a1214");
+
+      await char.startNotifications();
+      char.addEventListener("characteristicvaluechanged", handleBleNotification);
+
+      bleDeviceRef.current = device;
+      bleCharRef.current = char;
+      setBleState((s) => ({ ...s, connected: true, connecting: false, deviceName: device.name || "MiRutina-Sensor" }));
+      showToast("¡Sensor XIAO conectado! 📡✓");
+    } catch (err) {
+      console.error("BLE Connect Error:", err);
+      setBleState((s) => ({ ...s, connected: false, connecting: false }));
+      if (err.name !== "NotFoundError") {
+        showToast("Error BLE: " + (err.message || err.name));
+      }
+    }
+  }
+
+  function disconnectBLE() {
+    try {
+      if (bleDeviceRef.current && bleDeviceRef.current.gatt && bleDeviceRef.current.gatt.connected) {
+        bleDeviceRef.current.gatt.disconnect();
+      }
+    } catch (e) {}
+    bleDeviceRef.current = null;
+    bleCharRef.current = null;
+    setBleState((s) => ({ ...s, connected: false, connecting: false }));
+    showToast("Sensor desconectado");
+  }
+
+  function handleBleClick() {
+    setSensorMonitorOpen(true);
+  }
+
+  function processSensorSample(ax, ay, az, gx, gy, gz) {
+    const now = Date.now();
+    const tel = telemetryRef.current;
+    tel.packetCount++;
+    tel.hzPackets++;
+
+    if (now - tel.lastHzTime >= 1000) {
+      tel.hz = Math.round(((tel.hzPackets * 1000) / (now - tel.lastHzTime)) * 10) / 10;
+      tel.hzPackets = 0;
+      tel.lastHzTime = now;
+    }
+
+    const rawMag = Math.sqrt(ax * ax + ay * ay + az * az);
+    const gMag = Math.sqrt(gx * gx + gy * gy + gz * gz);
+    const pitch = Math.atan2(ay, Math.sqrt(ax * ax + az * az)) * (180 / Math.PI);
+    const roll = Math.atan2(-ax, az) * (180 / Math.PI);
+    const netAcc = rawMag - 1.0;
+
+    if (!tel.paused) {
+      tel.history.push({
+        t: now,
+        ax, ay, az,
+        gx, gy, gz,
+        mag: rawMag,
+        gMag,
+        pitch, roll,
+        netAcc
+      });
+      if (tel.history.length > tel.maxSamples) {
+        tel.history.shift();
+      }
+    }
+
+    // DSP para detección de repeticiones y VBT
+    const dsp = dspRef.current;
+    const dt = dsp.lastTimestamp ? Math.min(0.06, Math.max(0.01, (now - dsp.lastTimestamp) / 1000.0)) : 0.025;
+    dsp.lastTimestamp = now;
+
+    const ALPHA = 0.22;
+    dsp.filteredAcc = ALPHA * netAcc + (1.0 - ALPHA) * dsp.filteredAcc;
+    const fAcc = dsp.filteredAcc;
+
+    const wave = dsp.recentAcel;
+    wave.push(fAcc);
+    if (wave.length > 24) wave.shift();
+
+    const accLineal = fAcc * 9.80665;
+    const UMBRAL_BAJADA = -0.16;
+    const UMBRAL_SUBIDA = 0.18;
+    const UMBRAL_QUIETO = 0.07;
+    const MIN_REP_MS = 600;
+    const REST_TRIGGER_MS = 3600;
+
+    let phaseChanged = false;
+
+    switch (dsp.phase) {
+      case "IDLE":
+        dsp.vel = 0;
+        dsp.maxVel = 0;
+        dsp.velSum = 0;
+        dsp.velSamples = 0;
+
+        if (fAcc < UMBRAL_BAJADA) {
+          dsp.phase = "BAJADA";
+          dsp.repStartTime = now;
+          dsp.lastMovementTime = now;
+          phaseChanged = true;
+        } else if (fAcc > UMBRAL_SUBIDA) {
+          dsp.phase = "SUBIDA";
+          dsp.repStartTime = now;
+          dsp.concentricStartTime = now;
+          dsp.lastMovementTime = now;
+          phaseChanged = true;
+        }
+
+        if (dsp.repsCount > 0 && Math.abs(fAcc) < UMBRAL_QUIETO) {
+          if (now - dsp.lastMovementTime > REST_TRIGGER_MS) {
+            dsp.repsCount = 0;
+            dsp.lastMovementTime = now;
+            setTimeout(() => woComplete(), 10);
+            showToast("🎯 Fin de serie detectado (barra en soporte)");
+          }
+        }
+        break;
+
+      case "BAJADA":
+        dsp.lastMovementTime = now;
+        if (fAcc > UMBRAL_SUBIDA && now - dsp.repStartTime > 200) {
+          dsp.phase = "SUBIDA";
+          dsp.concentricStartTime = now;
+          dsp.vel = 0;
+          phaseChanged = true;
+        }
+        break;
+
+      case "SUBIDA":
+        dsp.lastMovementTime = now;
+        dsp.vel += accLineal * dt;
+        if (dsp.vel < 0) dsp.vel = 0;
+        if (dsp.vel > dsp.maxVel) dsp.maxVel = dsp.vel;
+        dsp.velSum += dsp.vel;
+        dsp.velSamples++;
+
+        if (fAcc <= UMBRAL_QUIETO && now - dsp.repStartTime >= MIN_REP_MS) {
+          dsp.repsCount++;
+          const duration = (now - dsp.repStartTime) / 1000.0;
+          const meanVel = dsp.velSamples > 0 ? dsp.velSum / dsp.velSamples : dsp.maxVel;
+          const peakVel = dsp.maxVel;
+
+          dsp.phase = "IDLE";
+          phaseChanged = true;
+
+          vibrate(25);
+
+          setWorkout((w) => {
+            if (w && w.phase === "work") {
+              return { ...w, reps: String(dsp.repsCount) };
+            }
+            return w;
+          });
+
+          setBleState((s) => ({
+            ...s,
+            reps: dsp.repsCount,
+            lastMeanVel: meanVel,
+            lastPeakVel: peakVel,
+            lastDuration: duration,
+            history: [...s.history, { rep: dsp.repsCount, meanVel, peakVel, dur: duration, t: now }],
+          }));
+        }
+        break;
+    }
+
+    if (phaseChanged || now - (dsp._lastUiUpdate || 0) > 80) {
+      dsp._lastUiUpdate = now;
+      setBleState((s) => ({
+        ...s,
+        phase: dsp.phase,
+        raw: { ax, ay, az, gx, gy, gz, mag: rawMag, netAcc: fAcc },
+      }));
+    }
+  }
+
+  function handleBleNotification(event) {
+    const val = event.target.value;
+    if (val.byteLength < 12) return;
+
+    const ax = val.getInt16(0, true) / 1000.0;
+    const ay = val.getInt16(2, true) / 1000.0;
+    const az = val.getInt16(4, true) / 1000.0;
+    const gx = val.getInt16(6, true);
+    const gy = val.getInt16(8, true);
+    const gz = val.getInt16(10, true);
+
+    processSensorSample(ax, ay, az, gx, gy, gz);
+  }
 
   /* temporizador manual del pie */
   const [total, setTotal] = useState(0);
@@ -835,6 +1932,7 @@ function App() {
   /* ---- entrenamiento ---- */
   function startWorkout(exId) {
     ensureAudio();
+    resetSensorReps();
     const ex = exById(exId);
     if (!ex) return;
     const arr = getArr(ex);
@@ -865,6 +1963,7 @@ function App() {
     });
   }
   function woAdvance() {
+    resetSensorReps();
     setWorkout((w) => {
       if (!w) return w;
       const ex = exById(w.exId);
@@ -1057,10 +2156,22 @@ function App() {
           <span className="brand-logo" />
           <span className="brand-name">Mi Rutina</span>
           <span className="brand-tag">PRO</span>
-          <button className="icon-btn" onClick={() => setSessionsOpen(true)} aria-label="Bitácora de sesiones">
-            📒
-            {sessions.length > 0 && <span className="icon-badge">{sessions.length > 99 ? "99+" : sessions.length}</span>}
-          </button>
+          <div className="brand-actions">
+            <button
+              className={"icon-btn ble-btn" + (bleState.connected ? " on" : bleState.connecting ? " busy" : isDemoMode ? " demo" : "")}
+              onClick={handleBleClick}
+              title={bleState.connected ? `Sensor Seeed Conectado (${telemetryRef.current?.hz || 40} Hz) - Ver gráficas` : isDemoMode ? "Modo Demo Activo - Ver gráficas" : "Ver gráficas y telemetría de sensores Seeed Studio"}
+              aria-label="Sensor Bluetooth Seeed"
+            >
+              📡
+              {bleState.connected && <span className="ble-dot-on" />}
+              {isDemoMode && <span className="ble-dot-demo" />}
+            </button>
+            <button className="icon-btn" onClick={() => setSessionsOpen(true)} aria-label="Bitácora de sesiones">
+              📒
+              {sessions.length > 0 && <span className="icon-badge">{sessions.length > 99 ? "99+" : sessions.length}</span>}
+            </button>
+          </div>
         </div>
         <div className="days">
           {routine.days.map((d, i) => (
@@ -1092,6 +2203,9 @@ function App() {
             <div className="head-actions">
               <button className="reset" onClick={() => setSummaryOpen((v) => !v)}>
                 {summaryOpen ? "Ocultar resumen" : "📊 Resumen del día"}
+              </button>
+              <button className="reset sensor-nav-btn" onClick={() => setSensorMonitorOpen(true)}>
+                📡 Sensores Seeed {bleState.connected ? "🟢" : isDemoMode ? "🟣" : ""}
               </button>
               <button className="reset" onClick={resetDay}>Reiniciar día</button>
             </div>
@@ -1351,11 +2465,29 @@ function App() {
           onNext={woNext}
           onFinish={woFinish}
           onStop={woStop}
+          bleState={bleState}
+          onConnectBle={connectBLE}
+          onOpenSensorMonitor={() => setSensorMonitorOpen(true)}
+          wavePoints={wavePoints}
         />
       )}
 
       {sessionsOpen && (
         <SessionsScreen sessions={sessions} onClose={() => setSessionsOpen(false)} onExport={exportSessionsCSV} onClear={clearSessions} />
+      )}
+
+      {sensorMonitorOpen && (
+        <SensorMonitorModal
+          bleState={bleState}
+          telemetryRef={telemetryRef}
+          onConnect={connectBLE}
+          onDisconnect={disconnectBLE}
+          onClose={() => setSensorMonitorOpen(false)}
+          isDemo={isDemoMode}
+          onStartDemo={startDemoTelemetry}
+          onStopDemo={stopDemoTelemetry}
+          onClearTelemetry={clearTelemetry}
+        />
       )}
     </div>
   );
@@ -1645,6 +2777,366 @@ input, textarea { font-family: inherit; }
 .toast { position: fixed; bottom: calc(96px + env(safe-area-inset-bottom)); left: 50%; transform: translateX(-50%); z-index: 110; background: var(--text); border: none; color: #fff; font-size: 13px; font-weight: 700; padding: 11px 18px; border-radius: 99px; white-space: nowrap; box-shadow: 0 8px 30px rgba(31,42,61,.35); animation: toastIn .25s cubic-bezier(.2,.8,.2,1) both; }
 .confetti { position: fixed; inset: 0; z-index: 100; pointer-events: none; overflow: hidden; }
 .cf { position: absolute; top: -20px; border-radius: 2px; animation: cfFall linear both; }
+
+/* ---- Bluetooth & Sensor HUD ---- */
+.brand-actions { margin-left: auto; display: flex; align-items: center; gap: 8px; }
+.brand-actions .icon-btn { margin-left: 0; }
+.ble-btn.on { border-color: rgba(16,185,129,.45); background: #F0FDF4; }
+.ble-btn.busy { animation: pulseRing 1.2s infinite; border-color: var(--blue); }
+.ble-btn.demo { border-color: rgba(168,85,247,.45); background: #FAF5FF; }
+.ble-dot-on { position: absolute; top: -3px; right: -3px; width: 9px; height: 9px; border-radius: 99px; background: #10B981; border: 2px solid #fff; box-shadow: 0 0 6px #10B981; }
+.ble-dot-demo { position: absolute; top: -3px; right: -3px; width: 9px; height: 9px; border-radius: 99px; background: #A855F7; border: 2px solid #fff; box-shadow: 0 0 6px #A855F7; }
+
+.sensor-nav-btn { background: rgba(255,255,255,.24) !important; border-color: rgba(255,255,255,.45) !important; font-weight: 800 !important; }
+.sensor-nav-btn:hover { background: rgba(255,255,255,.32) !important; }
+
+.ov-hud {
+  margin: 12px 0 16px; width: 100%; max-width: 360px;
+  background: var(--surface); border: 1.5px solid rgba(45,127,249,.25);
+  border-radius: 18px; padding: 13px 14px; box-shadow: var(--shadow-card);
+}
+.ov-hud-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+.ov-hud-badge { font-size: 10.5px; font-weight: 900; letter-spacing: .06em; color: var(--blue); display: flex; align-items: center; gap: 6px; }
+.hud-live-dot { width: 7px; height: 7px; border-radius: 99px; background: #10B981; box-shadow: 0 0 6px #10B981; animation: pulseRing 1.5s infinite; }
+.ov-hud-phase { font-size: 10.5px; font-weight: 800; padding: 2px 7px; border-radius: 6px; }
+.ov-hud-phase.idle { background: rgba(138,148,166,.12); color: var(--muted); }
+.ov-hud-phase.bajada { background: rgba(255,122,69,.12); color: var(--coral); }
+.ov-hud-phase.subida { background: rgba(16,185,129,.15); color: #059669; }
+
+.ov-hud-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 8px; }
+.hud-metric { background: var(--surface2); border-radius: 12px; padding: 8px 6px; text-align: center; }
+.hud-metric.highlight { background: rgba(45,127,249,.08); border: 1px solid rgba(45,127,249,.2); }
+.hud-m-val { font-size: 20px; font-weight: 900; color: var(--text); font-variant-numeric: tabular-nums; }
+.hud-metric.highlight .hud-m-val { color: var(--blue); }
+.hud-unit { font-size: 10px; font-weight: 700; opacity: .75; margin-left: 2px; }
+.hud-m-lbl { font-size: 9.5px; font-weight: 700; color: var(--muted); margin-top: 2px; }
+
+.hud-wave-wrap { height: 26px; width: 100%; border-radius: 8px; background: var(--surface2); overflow: hidden; padding: 2px 0; margin-bottom: 6px; }
+.hud-svg { width: 100%; height: 100%; display: block; }
+.ov-hud-actions { display: flex; flex-direction: column; align-items: center; gap: 6px; margin-top: 4px; }
+.hud-foot { font-size: 10px; font-weight: 600; color: var(--muted); text-align: center; }
+.ov-hud-view-btn { background: none; border: 1px solid rgba(45,127,249,.35); color: var(--blue); font-size: 11px; font-weight: 800; border-radius: 8px; padding: 5px 11px; cursor: pointer; transition: all .15s ease; }
+.ov-hud-view-btn:hover { background: rgba(45,127,249,.08); }
+
+.ov-sensor-prompt-box { display: flex; flex-direction: column; align-items: center; width: 100%; max-width: 360px; margin: 12px 0 16px; gap: 6px; }
+.ov-sensor-prompt {
+  width: 100%;
+  background: rgba(45,127,249,.06); border: 1.5px dashed rgba(45,127,249,.35);
+  border-radius: 16px; padding: 12px 14px; display: flex; flex-direction: column; align-items: center; gap: 3px;
+  color: var(--blue); cursor: pointer; text-align: center;
+}
+.ov-sensor-prompt:hover { background: rgba(45,127,249,.1); }
+.ov-sensor-prompt span:first-child { font-size: 13px; font-weight: 800; }
+.prompt-sub { font-size: 11px; font-weight: 600; opacity: .8; color: var(--muted); }
+.ov-sensor-monitor-link { background: none; border: none; font-size: 11.5px; font-weight: 700; color: var(--muted); cursor: pointer; text-decoration: underline; }
+
+.ov-vbt-summary { margin-top: 14px; width: 100%; max-width: 360px; background: var(--surface); border: 1px solid var(--line); border-radius: 15px; padding: 12px; }
+.vbt-sum-title { font-size: 12px; font-weight: 800; color: var(--blue); margin-bottom: 8px; }
+.vbt-reps-list { display: flex; flex-wrap: wrap; gap: 6px; }
+.vbt-rep-chip { font-size: 11px; background: var(--surface2); padding: 4px 8px; border-radius: 8px; }
+
+/* ========================================================
+   MODAL DE TELEMETRÍA Y SENSORES SEEED STUDIO
+   ======================================================== */
+.sensor-modal-backdrop {
+  position: fixed; inset: 0; z-index: 105;
+  background: rgba(10, 15, 29, 0.72);
+  backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
+  display: flex; align-items: center; justify-content: center;
+  padding: 12px; animation: fadeIn .2s ease both;
+}
+
+.sensor-modal {
+  width: 100%; max-width: 580px; max-height: 94vh;
+  background: #0F172A; color: #F8FAFC;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 24px; display: flex; flex-direction: column;
+  box-shadow: 0 25px 60px -12px rgba(0, 0, 0, 0.7), 0 0 0 1px rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+}
+
+.sensor-head {
+  padding: 16px 18px 14px; background: #0B1120;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+}
+.sensor-head-info { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.sensor-head-title {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 16px; font-weight: 800; letter-spacing: -0.01em; color: #FFFFFF;
+}
+.sensor-chip-icon {
+  width: 24px; height: 24px; border-radius: 8px;
+  background: linear-gradient(135deg, #38BDF8, #2563EB);
+  display: inline-flex; align-items: center; justify-content: center; font-size: 13px;
+}
+.sensor-chip-model {
+  font-size: 10px; font-weight: 800; color: #38BDF8;
+  background: rgba(56, 189, 248, 0.12); border: 1px solid rgba(56, 189, 248, 0.3);
+  border-radius: 6px; padding: 2px 6px; letter-spacing: .05em;
+}
+.sensor-status-bar { display: flex; align-items: center; gap: 8px; font-size: 11px; flex-wrap: wrap; }
+.sensor-badge {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 2px 7px; border-radius: 99px; font-weight: 800; font-size: 10px; letter-spacing: .04em;
+}
+.sensor-badge.on { background: rgba(16, 185, 129, 0.16); color: #34D399; border: 1px solid rgba(16, 185, 129, 0.35); }
+.sensor-badge.demo { background: rgba(168, 85, 247, 0.18); color: #C084FC; border: 1px solid rgba(168, 85, 247, 0.4); }
+.sensor-badge.busy { background: rgba(56, 189, 248, 0.16); color: #38BDF8; border: 1px solid rgba(56, 189, 248, 0.35); }
+.sensor-badge.off { background: rgba(148, 163, 184, 0.12); color: #94A3B8; border: 1px solid rgba(148, 163, 184, 0.25); }
+.s-dot { width: 6px; height: 6px; border-radius: 99px; display: inline-block; }
+.s-dot.on { background: #10B981; box-shadow: 0 0 6px #10B981; animation: pulseRing 1.4s infinite; }
+.s-dot.demo { background: #A855F7; box-shadow: 0 0 6px #A855F7; }
+.s-dot.busy { background: #38BDF8; animation: blink 1s infinite; }
+.s-dot.off { background: #64748B; }
+.sensor-rate-text { color: #64748B; font-weight: 700; font-variant-numeric: tabular-nums; }
+
+.sensor-head-actions { display: flex; align-items: center; gap: 8px; }
+.s-btn {
+  padding: 8px 14px; border-radius: 11px; font-size: 12px; font-weight: 800;
+  cursor: pointer; border: none; transition: all .15s ease;
+}
+.s-btn.primary { background: linear-gradient(135deg, #38BDF8, #2563EB); color: #fff; box-shadow: 0 4px 14px rgba(37,99,235,.35); }
+.s-btn.secondary { background: rgba(255,255,255,.08); color: #E2E8F0; border: 1px solid rgba(255,255,255,.16); }
+.s-btn.secondary:hover { background: rgba(255,255,255,.14); }
+.s-btn.danger { background: rgba(239, 68, 68, 0.18); color: #FCA5A5; border: 1px solid rgba(239, 68, 68, 0.35); }
+.s-btn.danger:hover { background: rgba(239, 68, 68, 0.28); }
+.s-close-btn {
+  width: 32px; height: 32px; border-radius: 10px; border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.05); color: #94A3B8; font-size: 14px; font-weight: 800;
+  cursor: pointer; display: flex; align-items: center; justify-content: center;
+}
+.s-close-btn:hover { color: #fff; background: rgba(255, 255, 255, 0.12); }
+
+/* Pestañas */
+.sensor-tabs {
+  display: flex; gap: 4px; padding: 6px 14px; background: #0B1120;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08); overflow-x: auto;
+}
+.s-tab {
+  padding: 8px 12px; border-radius: 9px; border: none; background: transparent;
+  color: #94A3B8; font-size: 12px; font-weight: 800; cursor: pointer; white-space: nowrap;
+}
+.s-tab.active { background: rgba(255, 255, 255, 0.1); color: #FFFFFF; }
+.s-tab:hover:not(.active) { color: #E2E8F0; }
+
+.sensor-view-body {
+  padding: 14px; overflow-y: auto; max-height: calc(94vh - 120px);
+  display: flex; flex-direction: column; gap: 12px;
+}
+.sensor-view-body.info { gap: 14px; }
+
+/* Barra de controles del Osciloscopio */
+.sensor-chart-toolbar {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 8px; flex-wrap: wrap; background: rgba(255, 255, 255, 0.03);
+  padding: 8px 10px; border-radius: 12px; border: 1px solid rgba(255, 255, 255, 0.06);
+}
+.s-tgroup { display: flex; align-items: center; gap: 5px; }
+.s-tgroup.right { margin-left: auto; }
+.s-lbl { font-size: 11px; font-weight: 700; color: #64748B; }
+.s-pill {
+  padding: 4px 8px; border-radius: 7px; border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.04); color: #94A3B8; font-size: 11px; font-weight: 700;
+  cursor: pointer;
+}
+.s-pill.on { background: #2563EB; color: #fff; border-color: transparent; }
+.s-tool-btn {
+  padding: 5px 9px; border-radius: 7px; border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.05); color: #CBD5E1; font-size: 11px; font-weight: 800; cursor: pointer;
+}
+.s-tool-btn.active { background: rgba(245, 158, 11, 0.2); color: #FBBF24; border-color: rgba(245, 158, 11, 0.4); }
+
+/* Canvas Osciloscopio */
+.sensor-canvas-wrapper {
+  width: 100%; height: 260px; min-height: 220px;
+  background: #0A0F1D; border-radius: 16px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  overflow: hidden; position: relative; box-shadow: inset 0 2px 10px rgba(0,0,0,0.6);
+}
+.sensor-canvas { width: 100%; height: 100%; display: block; }
+
+/* Selector de ejes */
+.sensor-legend-bar {
+  display: flex; flex-direction: column; gap: 8px;
+  background: rgba(255, 255, 255, 0.03); padding: 9px 12px;
+  border-radius: 12px; border: 1px solid rgba(255, 255, 255, 0.06);
+}
+.sensor-legend-group { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+.sensor-legend-group-title { font-size: 10.5px; font-weight: 900; color: #64748B; width: 34px; }
+.s-axis-chip {
+  padding: 4px 9px; border-radius: 8px; font-size: 11px; font-weight: 800;
+  border: 1px solid rgba(255, 255, 255, 0.1); background: rgba(255, 255, 255, 0.04);
+  color: #64748B; cursor: pointer; display: inline-flex; align-items: center; gap: 5px;
+  transition: all .15s ease;
+}
+.s-axis-chip .s-axis-dot {
+  width: 7px; height: 7px; border-radius: 99px; background: currentColor; opacity: .4;
+}
+.s-axis-chip.on {
+  color: #fff; border-color: var(--ax-col); background: rgba(255, 255, 255, 0.08);
+}
+.s-axis-chip.on .s-axis-dot { background: var(--ax-col); opacity: 1; box-shadow: 0 0 6px var(--ax-col); }
+
+/* Aviso sensor desconectado */
+.sensor-idle-card {
+  padding: 14px 16px; border-radius: 14px;
+  background: rgba(37, 99, 235, 0.08); border: 1px dashed rgba(56, 189, 248, 0.35);
+  display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+}
+.sensor-idle-text { font-size: 12.5px; color: #CBD5E1; line-height: 1.5; flex: 1; min-width: 220px; }
+.sensor-idle-btns { display: flex; gap: 8px; }
+
+/* Pestaña 3D y Orientación */
+.sensor-3d-layout { display: flex; flex-direction: column; gap: 12px; }
+.sensor-3d-card, .sensor-horizon-card {
+  background: rgba(255, 255, 255, 0.03); border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 18px; padding: 14px;
+}
+.sensor-card-head { font-size: 13px; font-weight: 800; color: #38BDF8; margin-bottom: 12px; }
+.sensor-scene-3d {
+  width: 100%; height: 210px; display: flex; align-items: center; justify-content: center;
+  perspective: 700px; -webkit-perspective: 700px;
+}
+
+/* Placa XIAO en CSS 3D */
+.xiao-board-3d {
+  width: 140px; height: 180px; background: #0E1A2F;
+  border: 2px solid #2563EB; border-radius: 16px; position: relative;
+  box-shadow: 0 15px 35px rgba(0, 0, 0, 0.7), 0 0 20px rgba(37, 99, 235, 0.25);
+  transform-style: preserve-3d; transition: transform 0.06s linear;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+}
+.xiao-usbc-port {
+  position: absolute; top: -6px; width: 44px; height: 12px;
+  background: #CBD5E1; border: 1px solid #94A3B8; border-radius: 4px;
+}
+.xiao-chip-label { font-size: 9px; font-weight: 900; color: #38BDF8; letter-spacing: .08em; margin-bottom: 8px; }
+.xiao-chip-main {
+  width: 72px; height: 72px; background: #1E293B; border: 1px solid #475569;
+  border-radius: 10px; display: flex; flex-direction: column; align-items: center; justify-content: center;
+  color: #E2E8F0; font-weight: 900; font-size: 11px;
+}
+.xiao-chip-main small { font-size: 8px; color: #38BDF8; letter-spacing: .1em; }
+.xiao-imu-chip {
+  position: absolute; bottom: 38px; font-size: 8px; font-weight: 800;
+  color: #94A3B8; background: #1E293B; padding: 2px 5px; border-radius: 4px; border: 1px solid #334155;
+}
+.xiao-rgb-led {
+  position: absolute; bottom: 18px; width: 8px; height: 8px;
+  border-radius: 99px; background: #10B981; box-shadow: 0 0 8px #10B981;
+}
+.xiao-rgb-led.blinking { animation: blink .8s infinite; }
+.xiao-pins-left, .xiao-pins-right {
+  position: absolute; top: 16px; bottom: 16px; display: flex; flex-direction: column;
+  justify-content: space-between;
+}
+.xiao-pins-left { left: 4px; }
+.xiao-pins-right { right: 4px; }
+.xiao-pin {
+  width: 7px; height: 11px; background: #F59E0B; border-radius: 3px;
+  box-shadow: 0 0 4px rgba(245, 158, 11, 0.6);
+}
+.xiao-3d-hint { font-size: 11px; font-weight: 600; color: #64748B; text-align: center; margin-top: 10px; }
+
+/* Nivel de burbuja */
+.level-wrapper { display: flex; align-items: center; justify-content: space-around; gap: 16px; flex-wrap: wrap; }
+.bubble-circle {
+  width: 120px; height: 120px; border-radius: 99px;
+  background: radial-gradient(circle, #0F172A 0%, #060911 100%);
+  border: 2px solid rgba(56, 189, 248, 0.35); position: relative; overflow: hidden;
+  box-shadow: inset 0 0 16px rgba(0,0,0,0.8), 0 0 12px rgba(56, 189, 248, 0.15);
+}
+.bubble-cross-x { position: absolute; left: 0; right: 0; top: 50%; height: 1px; background: rgba(56, 189, 248, 0.25); }
+.bubble-cross-y { position: absolute; top: 0; bottom: 0; left: 50%; width: 1px; background: rgba(56, 189, 248, 0.25); }
+.bubble-ring-center {
+  position: absolute; top: 50%; left: 50%; width: 28px; height: 28px;
+  border-radius: 99px; border: 1.5px dashed rgba(56, 189, 248, 0.45);
+  transform: translate(-50%, -50%);
+}
+.bubble-dot {
+  position: absolute; top: 50%; left: 50%; width: 18px; height: 18px;
+  border-radius: 99px; background: #38BDF8; box-shadow: 0 0 10px #38BDF8;
+  transition: transform 0.05s linear; pointer-events: none;
+}
+.level-angles { display: flex; flex-direction: column; gap: 10px; }
+.level-angle-item { display: flex; flex-direction: column; gap: 2px; }
+.level-angle-lbl { font-size: 11px; color: #94A3B8; font-weight: 700; }
+.level-angle-val { font-size: 22px; font-weight: 900; color: #38BDF8; font-variant-numeric: tabular-nums; }
+
+/* Pestaña Medidores y Gauges */
+.sensor-gauges-section { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+@media (max-width: 480px) { .sensor-gauges-section { grid-template-columns: 1fr; } }
+.sensor-kpi-block {
+  background: rgba(255, 255, 255, 0.03); border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 16px; padding: 13px; display: flex; flex-direction: column; gap: 10px;
+}
+.sensor-block-title { font-size: 12px; font-weight: 800; color: #38BDF8; letter-spacing: .02em; }
+.sensor-gauge-rows { display: flex; flex-direction: column; gap: 8px; }
+.gauge-row {
+  background: rgba(255, 255, 255, 0.03); border-radius: 10px; padding: 7px 9px;
+  display: flex; flex-direction: column; gap: 4px;
+}
+.gauge-row.highlight { background: rgba(245, 158, 11, 0.08); border: 1px solid rgba(245, 158, 11, 0.2); }
+.gauge-row-info { display: flex; justify-content: space-between; align-items: baseline; }
+.gauge-lbl { font-size: 11px; font-weight: 800; }
+.gauge-val { font-size: 14px; font-weight: 900; color: #F8FAFC; font-variant-numeric: tabular-nums; }
+
+/* Barra Bipolar */
+.bipolar-track {
+  width: 100%; height: 6px; border-radius: 99px; background: rgba(255, 255, 255, 0.08);
+  position: relative; overflow: hidden;
+}
+.bipolar-center-line {
+  position: absolute; left: 50%; top: 0; bottom: 0; width: 1.5px;
+  background: rgba(255, 255, 255, 0.35); transform: translateX(-50%); z-index: 2;
+}
+.bipolar-fill { position: absolute; top: 0; bottom: 0; border-radius: 99px; transition: all 0.05s linear; }
+
+/* Tarjeta VBT */
+.sensor-vbt-card {
+  background: rgba(255, 255, 255, 0.03); border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 16px; padding: 13px; display: flex; flex-direction: column; gap: 10px;
+}
+.sensor-vbt-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+@media (max-width: 480px) { .sensor-vbt-grid { grid-template-columns: 1fr 1fr; } }
+.vbt-grid-item {
+  background: rgba(255, 255, 255, 0.03); border-radius: 12px; padding: 9px;
+  display: flex; flex-direction: column; gap: 3px;
+}
+.vbt-sub { font-size: 10px; font-weight: 700; color: #94A3B8; }
+.vbt-big-num { font-size: 20px; font-weight: 900; color: #F8FAFC; font-variant-numeric: tabular-nums; }
+.vbt-big-num small { font-size: 11px; opacity: .7; }
+.vbt-phase-pill {
+  font-size: 10.5px; font-weight: 800; border-radius: 6px; padding: 3px 6px;
+  white-space: nowrap; width: fit-content;
+}
+.vbt-phase-pill.idle { background: rgba(148, 163, 184, 0.15); color: #94A3B8; }
+.vbt-phase-pill.bajada { background: rgba(255, 122, 69, 0.18); color: #FF7A45; }
+.vbt-phase-pill.subida { background: rgba(16, 185, 129, 0.2); color: #34D399; }
+
+/* Pestaña Info y Diagnóstico */
+.sensor-info-card {
+  background: rgba(255, 255, 255, 0.03); border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 16px; padding: 14px; display: flex; flex-direction: column; gap: 10px;
+}
+.info-grid { display: flex; flex-direction: column; gap: 8px; }
+.info-row {
+  display: flex; justify-content: space-between; align-items: center;
+  gap: 10px; font-size: 12px; border-bottom: 1px solid rgba(255, 255, 255, 0.05); padding-bottom: 6px;
+}
+.info-row:last-child { border-bottom: none; }
+.info-k { color: #94A3B8; font-weight: 700; flex-shrink: 0; }
+.info-v { color: #F8FAFC; font-weight: 700; text-align: right; }
+.font-mono { font-family: monospace; font-size: 11px; }
+.copy-btn {
+  margin-left: 6px; background: rgba(255, 255, 255, 0.08); border: 1px solid rgba(255, 255, 255, 0.15);
+  color: #38BDF8; font-size: 10px; font-weight: 800; border-radius: 5px; padding: 2px 6px; cursor: pointer;
+}
+.info-desc { font-size: 12px; color: #94A3B8; margin: 0; line-height: 1.5; }
+.info-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.sensor-guide-list { margin: 0; padding-left: 20px; font-size: 12px; color: #CBD5E1; line-height: 1.6; }
+.sensor-guide-list code { background: rgba(255, 255, 255, 0.1); padding: 1px 5px; border-radius: 4px; color: #38BDF8; }
 
 @media (prefers-reduced-motion: reduce) {
   *, .bar-fill, .ring-fg, .dot, .day-btn, .rise, .rise-fast { animation: none !important; transition: none !important; }
